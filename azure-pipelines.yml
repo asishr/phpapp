@@ -1,0 +1,75 @@
+trigger:
+- main
+
+pr:
+- main
+
+variables:
+  phpVersion: '8.2'
+  artifactName: 'phpapp-package'
+
+stages:
+- stage: BuildAndTest
+  displayName: Build and Test
+  jobs:
+  - job: Build
+    displayName: Build Job
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - task: UsePHPVersion@0
+      displayName: Use PHP $(phpVersion)
+      inputs:
+        versionSpec: '$(phpVersion)'
+
+    - script: |
+        composer validate --no-check-publish
+        composer install --no-interaction --prefer-dist
+      displayName: Install dependencies
+
+    - script: composer test
+      displayName: Run unit tests
+
+    - task: ArchiveFiles@2
+      displayName: Create deployment package
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish build artifact
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
+        artifactName: drop
+        publishLocation: Container
+
+- stage: Deploy
+  displayName: Deploy to Azure App Service
+  dependsOn: BuildAndTest
+  condition: succeeded()
+  jobs:
+  - deployment: DeployWeb
+    displayName: Deploy PHP app
+    environment: training
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+
+          - task: AzureWebApp@1
+            displayName: Deploy to Azure Web App (Linux)
+            inputs:
+              azureSubscription: 'YOUR-AZURE-SERVICE-CONNECTION'
+              appType: webAppLinux
+              appName: 'YOUR-AZURE-WEBAPP-NAME'
+              runtimeStack: 'PHP|8.2'
+              package: '$(Pipeline.Workspace)/drop/$(artifactName).zip'
