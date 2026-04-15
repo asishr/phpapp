@@ -25,10 +25,10 @@ stages:
       vmImage: 'ubuntu-latest'
 
     steps:
-    - task: UsePHPVersion@0
-      displayName: Use PHP $(phpVersion)
-      inputs:
-        versionSpec: '$(phpVersion)'
+    - script: |
+        php -v
+        composer --version
+      displayName: Verify PHP and Composer
 
     - script: |
         composer validate --no-check-publish
