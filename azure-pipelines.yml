@@ -6,7 +6,14 @@ pr:
 
 variables:
   phpVersion: '8.2'
-  artifactName: 'phpapp-package'
+  azureServiceConnection: 'YOUR-AZURE-SERVICE-CONNECTION'
+  resourceGroup: 'YOUR-RESOURCE-GROUP'
+  location: 'eastus'
+  containerAppEnvironment: 'YOUR-CONTAINERAPP-ENV'
+  containerAppName: 'YOUR-CONTAINER-APP-NAME'
+  acrName: 'YOUR-ACR-NAME'
+  imageRepository: 'phpapp'
+  imageTag: '$(Build.BuildId)'
 
 stages:
 - stage: BuildAndTest
@@ -31,29 +38,13 @@ stages:
     - script: composer test
       displayName: Run unit tests
 
-    - task: ArchiveFiles@2
-      displayName: Create deployment package
-      inputs:
-        rootFolderOrFile: '$(Build.SourcesDirectory)'
-        includeRootFolder: false
-        archiveType: zip
-        archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
-        replaceExistingArchive: true
-
-    - task: PublishBuildArtifacts@1
-      displayName: Publish build artifact
-      inputs:
-        pathToPublish: '$(Build.ArtifactStagingDirectory)/$(artifactName).zip'
-        artifactName: drop
-        publishLocation: Container
-
 - stage: Deploy
-  displayName: Deploy to Azure App Service
+  displayName: Build Image and Deploy to Azure Container Apps
   dependsOn: BuildAndTest
   condition: succeeded()
   jobs:
-  - deployment: DeployWeb
-    displayName: Deploy PHP app
+  - deployment: DeployContainer
+    displayName: Deploy containerized PHP app
     environment: training
     pool:
       vmImage: 'ubuntu-latest'
@@ -62,14 +53,61 @@ stages:
       runOnce:
         deploy:
           steps:
-          - download: current
-            artifact: drop
-
-          - task: AzureWebApp@1
-            displayName: Deploy to Azure Web App (Linux)
+          - task: AzureCLI@2
+            displayName: Build/push image and deploy Container App
             inputs:
-              azureSubscription: 'YOUR-AZURE-SERVICE-CONNECTION'
-              appType: webAppLinux
-              appName: 'YOUR-AZURE-WEBAPP-NAME'
-              runtimeStack: 'PHP|8.2'
-              package: '$(Pipeline.Workspace)/drop/$(artifactName).zip'
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az extension add --name containerapp --upgrade --yes
+
+                ACR_LOGIN_SERVER="$(az acr show --name $(acrName) --query loginServer -o tsv)"
+                IMAGE_NAME="$ACR_LOGIN_SERVER/$(imageRepository):$(imageTag)"
+
+                echo "Logging into Azure Container Registry..."
+                az acr login --name $(acrName)
+
+                echo "Building and pushing image: $IMAGE_NAME"
+                docker build -t "$IMAGE_NAME" .
+                docker push "$IMAGE_NAME"
+
+                echo "Ensuring resource group and Container Apps environment exist..."
+                az group create --name $(resourceGroup) --location $(location)
+
+                if ! az containerapp env show --name $(containerAppEnvironment) --resource-group $(resourceGroup) >/dev/null 2>&1; then
+                  az containerapp env create \
+                    --name $(containerAppEnvironment) \
+                    --resource-group $(resourceGroup) \
+                    --location $(location)
+                fi
+
+                ACR_USERNAME="$(az acr credential show --name $(acrName) --query username -o tsv)"
+                ACR_PASSWORD="$(az acr credential show --name $(acrName) --query passwords[0].value -o tsv)"
+
+                echo "Creating or updating Azure Container App..."
+                if az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) >/dev/null 2>&1; then
+                  az containerapp update \
+                    --name $(containerAppName) \
+                    --resource-group $(resourceGroup) \
+                    --image "$IMAGE_NAME" \
+                    --registry-server "$ACR_LOGIN_SERVER" \
+                    --registry-username "$ACR_USERNAME" \
+                    --registry-password "$ACR_PASSWORD"
+                else
+                  az containerapp create \
+                    --name $(containerAppName) \
+                    --resource-group $(resourceGroup) \
+                    --environment $(containerAppEnvironment) \
+                    --image "$IMAGE_NAME" \
+                    --target-port 80 \
+                    --ingress external \
+                    --registry-server "$ACR_LOGIN_SERVER" \
+                    --registry-username "$ACR_USERNAME" \
+                    --registry-password "$ACR_PASSWORD"
+                fi
+
+                APP_URL="$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query properties.configuration.ingress.fqdn -o tsv)"
+                echo "Container app deployed: https://$APP_URL"
